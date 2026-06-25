@@ -1,0 +1,760 @@
+# Микросервисы
+
+> 📇 Справочник уровня middle. Формат: ответ по сути → архитектурные детали → реальный пример → ❗ на чём ловят на собесе → уточняющий вопрос.
+
+**Всего вопросов: 26**
+
+---
+
+## 1. Что такое паттерн Saga и когда его использовать?
+
+Saga — паттерн для реализации распределённых транзакций в микросервисной архитектуре. Вместо одной атомарной ACID-транзакции, охватывающей несколько сервисов, сага разбивает процесс на цепочку локальных транзакций: каждый сервис выполняет свою часть и публикует событие или вызывает следующий шаг. Если один из шагов падает, запускаются компенсирующие транзакции для отмены уже выполненных шагов.
+
+Используют Saga вместо 2PC (двухфазного коммита) по нескольким причинам: 2PC требует блокировки ресурсов на время всей транзакции, плохо масштабируется и создаёт единую точку отказа (координатор). Saga даёт eventual consistency — данные в конечном счёте согласуются, но не обязательно мгновенно. Это приемлемый компромисс для большинства бизнес-сценариев.
+
+В интернет-магазине: оформление заказа — это сага из шагов: `OrderService` создаёт заказ (статус PENDING) → `PaymentService` списывает деньги → `InventoryService` резервирует товар → `NotificationService` отправляет письмо. Если `InventoryService` отвечает «нет в наличии», запускаются компенсирующие шаги: `PaymentService` возвращает деньги, `OrderService` переводит заказ в статус CANCELLED.
+
+❗ Ловушка собеса: Saga не даёт изоляции (isolation) — пока сага выполняется, другой запрос может увидеть промежуточное состояние (деньги списаны, но заказ ещё не подтверждён). Это называется dirty read на уровне саги. Решение — semantic lock (блокировать запись флагом PENDING) или countermeasures из книги Ричардсона.
+
+**→ Уточняющий вопрос:** Как обеспечить идемпотентность шагов саги, если один и тот же шаг может выполниться дважды из-за ретрая?
+
+---
+
+## 2. В чём разница между хореографией и оркестрацией в Saga?
+
+**Хореография (Choreography)** — децентрализованный подход: каждый сервис знает, что делать при получении определённого события, и сам публикует следующее событие. Центрального координатора нет. `OrderService` публикует `OrderCreated` → `PaymentService` слушает, списывает деньги, публикует `PaymentCompleted` → `InventoryService` слушает и резервирует товар. Плюсы: слабая связанность, простота отдельных сервисов. Минусы: логика саги размазана по всем сервисам, тяжело отследить весь поток, сложно добавить новый шаг.
+
+**Оркестрация (Orchestration)** — централизованный подход: отдельный сервис-оркестратор (Saga Orchestrator) явно управляет шагами, вызывает нужные сервисы и обрабатывает ответы. Вся логика саги в одном месте. Плюсы: явный workflow, легко отлаживать, удобно для сложных бизнес-процессов. Минусы: оркестратор знает о всех сервисах (связанность), потенциальная точка отказа.
+
+```java
+// Оркестратор для саги оформления заказа
+@Service
+public class OrderSagaOrchestrator {
+
+    public void execute(Order order) {
+        try {
+            paymentService.charge(order.getPaymentDetails());  // шаг 1
+            inventoryService.reserve(order.getItems());         // шаг 2
+            notificationService.sendConfirmation(order);        // шаг 3
+            orderRepository.updateStatus(order.getId(), CONFIRMED);
+        } catch (PaymentException e) {
+            orderRepository.updateStatus(order.getId(), CANCELLED);
+        } catch (InventoryException e) {
+            paymentService.refund(order.getPaymentDetails());   // компенсация
+            orderRepository.updateStatus(order.getId(), CANCELLED);
+        }
+    }
+}
+```
+
+❗ Ловушка собеса: Оркестрация легко скатывается в антипаттерн «умный оркестратор — тупые сервисы», когда вся бизнес-логика уходит в оркестратор. Правило: оркестратор управляет потоком, а не бизнес-логикой — бизнес-правила остаются в каждом сервисе.
+
+**→ Уточняющий вопрос:** Как в хореографии понять, что вся сага завершилась успешно или откатилась — кто за это отвечает?
+
+---
+
+## 3. Как реализовать распределённые транзакции в микросервисах?
+
+Основной ответ — никак в классическом ACID-смысле. Вместо этого применяют паттерны eventual consistency. Главный инструмент — Saga (хореография или оркестрация). Для надёжной доставки событий используют **Outbox Pattern**: сервис сохраняет событие в локальную таблицу `outbox` в той же транзакции, что и бизнес-данные, а отдельный компонент (Debezium, Transactional Outbox Processor) читает таблицу и публикует в Kafka. Это гарантирует «ровно один раз» (at-least-once + идемпотентность на стороне потребителя).
+
+2PC (двухфазный коммит) теоретически возможен через XA-транзакции, но на практике избегают: блокирует ресурсы на время координации, требует XA-совместимые ресурсы, плохо масштабируется, координатор — единая точка отказа. В cloud-native среде это антипаттерн.
+
+```java
+// Outbox Pattern: атомарно сохраняем заказ и событие
+@Transactional
+public Order createOrder(CreateOrderRequest request) {
+    Order order = orderRepository.save(new Order(request));
+
+    // В той же транзакции пишем в outbox
+    OutboxEvent event = new OutboxEvent(
+        "order.created",
+        objectMapper.writeValueAsString(new OrderCreatedEvent(order.getId()))
+    );
+    outboxRepository.save(event);
+
+    return order; // Kafka-публикация отдельным процессом через polling outbox
+}
+```
+
+❗ Ловушка собеса: «А что если Kafka упадёт после коммита транзакции?» — именно для этого Outbox: сообщение уже в БД, процессор отправит его позже. Без Outbox возможна ситуация «деньги списаны, событие не отправлено».
+
+**→ Уточняющий вопрос:** Как Debezium помогает реализовать Outbox Pattern и что такое CDC (Change Data Capture)?
+
+---
+
+## 4. Что такое компенсирующие транзакции?
+
+Компенсирующая транзакция — это операция, которая семантически отменяет эффект уже выполненного шага саги. В отличие от классического rollback, который технически откатывает изменения в БД, компенсация создаёт новую запись, нейтрализующую предыдущую. Деньги списаны — компенсация делает возврат; товар зарезервирован — компенсация снимает резервирование.
+
+Важное свойство: компенсирующие транзакции должны быть идемпотентными (выполнение дважды даёт тот же результат) и коммутативными (порядок не важен). Не все операции можно компенсировать — отправленное email уже не отзовёшь. Для таких случаев используют compensatable actions только там, где это имеет смысл, а «необратимые» шаги ставят в конец саги (после всех рискованных шагов).
+
+```java
+// Компенсирующие шаги в PaymentService
+public void charge(PaymentRequest request) {
+    // основная транзакция
+    walletRepository.debit(request.getUserId(), request.getAmount());
+    transactionLog.save(new Transaction(request.getOrderId(), CHARGED));
+}
+
+public void refund(PaymentRequest request) {
+    // компенсирующая транзакция
+    if (transactionLog.exists(request.getOrderId(), CHARGED)) { // идемпотентность
+        walletRepository.credit(request.getUserId(), request.getAmount());
+        transactionLog.save(new Transaction(request.getOrderId(), REFUNDED));
+    }
+}
+```
+
+❗ Ловушка собеса: Компенсация не эквивалентна rollback. Между выполнением шага и его компенсацией другие транзакции могли прочитать промежуточное состояние (нарушение изоляции). Это называется «потерянная изоляция» (lost isolation) — собеседующий часто спрашивает про это.
+
+**→ Уточняющий вопрос:** Что делать, если компенсирующая транзакция тоже упала — как обеспечить её выполнение?
+
+---
+
+## 5. Что такое паттерн Circuit Breaker?
+
+Circuit Breaker («автоматический выключатель») — паттерн отказоустойчивости, который оборачивает вызов ненадёжного внешнего сервиса. Когда количество ошибок превышает порог, «предохранитель» размыкается: последующие вызовы немедленно возвращают ошибку (fail-fast), не тратя время на реальный запрос к упавшему сервису. Это предотвращает каскадные отказы: если `PaymentService` не отвечает, `OrderService` не накапливает зависшие потоки и не падает сам.
+
+Без Circuit Breaker: каждый запрос к упавшему сервису ждёт таймаут (например, 30 секунд), потоки накапливаются, память исчерпывается, `OrderService` тоже падает. С Circuit Breaker: после открытия цепи вызов занимает миллисекунды (немедленный возврат fallback-ответа), система деградирует gracefully, а не падает полностью.
+
+```java
+// Resilience4j Circuit Breaker
+@Bean
+public CircuitBreaker paymentCircuitBreaker(CircuitBreakerRegistry registry) {
+    CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50)           // открыть при 50% ошибок
+        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .slidingWindowSize(10)              // считать по последним 10 вызовам
+        .permittedNumberOfCallsInHalfOpenState(3)
+        .build();
+    return registry.circuitBreaker("paymentService", config);
+}
+
+// Использование в Feign / RestTemplate
+public PaymentResult charge(PaymentRequest request) {
+    return circuitBreaker.executeSupplier(
+        () -> paymentClient.charge(request),
+        throwable -> fallbackCharge(request)  // fallback
+    );
+}
+```
+
+❗ Ловушка собеса: Circuit Breaker не заменяет таймауты — они должны работать вместе. Без таймаута breaker не откроется, потому что вызовы будут висеть вечно, не возвращая ошибку.
+
+**→ Уточняющий вопрос:** Что происходит в состоянии HALF_OPEN и как настроить количество пробных запросов?
+
+---
+
+## 6. Как работает Circuit Breaker и какие у него состояния?
+
+Circuit Breaker имеет три состояния. **CLOSED** (замкнут) — нормальная работа: вызовы проходят, ошибки считаются в скользящем окне. Когда процент ошибок превышает порог (например, 50% за последние 10 запросов), переходит в OPEN. **OPEN** (разомкнут) — вызовы блокируются, сразу возвращается ошибка или fallback. После настроенного таймаута (например, 30 секунд) автоматически переходит в HALF_OPEN. **HALF_OPEN** (полуоткрыт) — пробный режим: пропускает ограниченное количество вызовов (например, 3). Если они успешны — переход в CLOSED, если нет — обратно в OPEN.
+
+Resilience4j дополнительно поддерживает **DISABLED** (мониторинг без блокировки) и **FORCED_OPEN** (принудительно открыт для обслуживания). Скользящее окно может быть count-based (последние N вызовов) или time-based (за последние N секунд).
+
+```
+CLOSED ──(ошибки > threshold)──→ OPEN
+  ↑                                 │
+  │                           (таймаут истёк)
+  │                                 ↓
+  └──(пробные вызовы OK)──── HALF_OPEN
+                                    │
+                         (пробные вызовы fail)
+                                    │
+                                    ↓
+                                  OPEN
+```
+
+❗ Ловушка собеса: В HALF_OPEN состоянии пробные вызовы идут к реальному сервису. Если в этот момент нагрузка высокая, сервис может снова упасть. Поэтому `permittedNumberOfCallsInHalfOpenState` должно быть небольшим, и нужен разогрев (warm-up).
+
+**→ Уточняющий вопрос:** Как Circuit Breaker взаимодействует с Retry — в каком порядке их нужно применять?
+
+---
+
+## 7. Что такое Service Discovery и зачем он нужен?
+
+Service Discovery — механизм динамического обнаружения адресов сервисов в распределённой системе. В контейнерной среде IP-адреса инстансов меняются при каждом рестарте, а количество инстансов меняется при масштабировании. Жёстко прописывать адреса в конфигах невозможно. Service Discovery решает это: сервисы регистрируются в реестре при старте и снимаются при остановке, клиенты обращаются по логическому имени.
+
+Два компонента: **Service Registry** (реестр: Eureka, Consul, etcd, Zookeeper) хранит актуальный список инстансов с адресами и состоянием; **Discovery Mechanism** — механизм запроса этого реестра. Реестр должен быть highly available и поддерживать health checks (удалять инстансы, которые не отвечают на heartbeat).
+
+```yaml
+# application.yml для регистрации в Eureka
+eureka:
+  client:
+    serviceUrl:
+      defaultZone: http://eureka-server:8761/eureka/
+  instance:
+    preferIpAddress: true
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+```
+
+❗ Ловушка собеса: Eureka имеет режим self-preservation — при потере связи с частью инстансов он НЕ удаляет их из реестра (предполагая сетевую проблему, а не падение инстансов). Клиенты получат «мёртвые» адреса и увидят ошибки. Это сознательный компромисс AP vs CP (CAP-теорема).
+
+**→ Уточняющий вопрос:** Чем Consul отличается от Eureka с точки зрения CAP-теоремы?
+
+---
+
+## 8. В чём разница между client-side и server-side discovery?
+
+**Client-side discovery**: клиент сам обращается в Service Registry, получает список инстансов и сам выбирает один (load balancing на стороне клиента). Пример: Spring Cloud + Eureka + Ribbon/Spring Cloud LoadBalancer. Плюсы: клиент контролирует алгоритм балансировки, нет дополнительного хопа. Минусы: логика discovery в каждом клиенте, зависимость от конкретного реестра, нужны библиотеки для каждого языка.
+
+**Server-side discovery**: клиент обращается на фиксированный адрес (балансировщик/прокси), тот сам знает инстансы из реестра. Пример: Kubernetes Service (kube-proxy), AWS ALB + ECS Service Discovery, Nginx + Consul Template. Плюсы: клиент прост и не знает о реестре, работает с любым языком. Минусы: дополнительный хоп, балансировщик — потенциальное узкое место.
+
+```
+Client-side:                    Server-side:
+ Client → Registry               Client → Load Balancer → Service
+ Client ← [IP1, IP2, IP3]                      ↑
+ Client → IP2 (выбранный)              Registry (знает о сервисах)
+```
+
+В Kubernetes де-факто server-side: `Service` с типом `ClusterIP` — это виртуальный IP, kube-proxy (или Cilium/Calico) перенаправляет трафик на реальные поды. ClusterIP стабилен, DNS-имя постоянно.
+
+❗ Ловушка собеса: В Kubernetes Eureka часто не нужен — K8s Service уже решает Service Discovery. Использовать Eureka поверх Kubernetes — overengineering, который создаёт два реестра, которые могут рассинхронизироваться.
+
+**→ Уточняющий вопрос:** Что такое Kubernetes Headless Service и когда его используют вместо обычного ClusterIP Service?
+
+---
+
+## 9. Что такое API Gateway и какие задачи он решает?
+
+API Gateway — единая точка входа для всех внешних клиентов (мобильное приложение, браузер, партнёры). Клиенты не знают о внутренней структуре системы: они обращаются на один адрес, Gateway маршрутизирует запрос к нужному сервису. Это позволяет менять внутреннюю архитектуру, не трогая клиентов.
+
+Задачи Gateway: **маршрутизация** (по пути, заголовкам, методу); **аутентификация и авторизация** (валидация JWT, интеграция с OAuth2/OIDC); **rate limiting и throttling** (защита от DDoS и злоупотреблений); **SSL termination** (HTTPS снаружи, HTTP внутри); **трансформация запросов** (добавление заголовков, изменение пути); **агрегация** (BFF pattern — объединить ответы нескольких сервисов для одного экрана); **кэширование**; **логирование и трейсинг**.
+
+```yaml
+# Spring Cloud Gateway — маршрутизация с фильтрами
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service          # lb:// = load-balanced через discovery
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+            - name: CircuitBreaker
+              args:
+                name: orderService
+                fallbackUri: forward:/fallback/orders
+```
+
+❗ Ловушка собеса: Gateway не должен содержать бизнес-логику — только инфраструктурные задачи. Если в Gateway начинают писать условия вроде «если premium-клиент, то дать скидку», это антипаттерн. Также: один Gateway — единая точка отказа, поэтому он должен быть горизонтально масштабируемым и stateless.
+
+**→ Уточняющий вопрос:** Что такое паттерн BFF (Backend for Frontend) и чем он отличается от обычного API Gateway?
+
+---
+
+## 10. Что такое шардирование (sharding)?
+
+Шардирование — стратегия горизонтального масштабирования БД путём разбиения данных на части (шарды) и распределения их по разным физическим узлам. Каждый шард — самостоятельный инстанс БД, содержащий только подмножество данных. Маршрутизация к нужному шарду происходит по **ключу шардирования** (shard key).
+
+Стратегии выбора шарда: **range-based** (пользователи A-M на шарде 1, N-Z на шарде 2 — неравномерно, горячие точки), **hash-based** (hash(user_id) % N — равномерно, но нельзя range-запросы), **directory-based** (таблица маппинга: user 123 → shard 3 — гибко, но extra hop). Выбор ключа шардирования критичен: плохой ключ создаёт hotspot (один шард перегружен).
+
+В интернет-магазине таблицу `orders` можно шардировать по `user_id`: все заказы одного пользователя на одном шарде — эффективны запросы «все заказы пользователя». Но если шардировать по `created_at`, новые заказы всегда идут на последний шард (hotspot).
+
+❗ Ловушка собеса: Ресшардирование (изменение количества шардов при росте) — крайне болезненная операция: нужно перераспределить данные между шардами, что требует простоя или сложной миграции. Consistent hashing решает эту проблему частично — при добавлении нового шарда перемещается только часть данных.
+
+**→ Уточняющий вопрос:** Как выполнять JOIN-запросы и транзакции между данными на разных шардах?
+
+---
+
+## 11. В чём разница между шардированием и партиционированием?
+
+**Партиционирование (partitioning)** — разбиение таблицы на логические части (партиции) внутри одного инстанса СУБД. Данные физически на одном сервере, СУБД управляет партициями автоматически. Цель — производительность (partition pruning при запросах), управляемость (удаление старых данных — просто удалить партицию), обслуживание. Пример: таблица `events` партиционирована по месяцам, запрос за март касается только одной партиции.
+
+**Шардирование (sharding)** — разбиение данных между разными физическими узлами (разные серверы/инстансы СУБД). Это распределённый подход, нужен application-level routing или middleware. Цель — масштабирование за пределы одной машины, увеличение пропускной способности записи. Шардирование включает партиционирование, но не наоборот.
+
+```
+Партиционирование:                  Шардирование:
+ PostgreSQL (один сервер)            Node 1: users 1-1M
+ ├── partition_2024_01               Node 2: users 1M-2M
+ ├── partition_2024_02               Node 3: users 2M-3M
+ └── partition_2024_03
+ (один сервер, разные файлы)        (разные серверы/инстансы)
+```
+
+❗ Ловушка собеса: Часто путают термины. В PostgreSQL есть declarative partitioning — это не шардирование. Citus (расширение PostgreSQL) добавляет настоящее шардирование поверх PostgreSQL. Cassandra и MongoDB имеют встроенное шардирование (называется sharding и partitioning соответственно).
+
+**→ Уточняющий вопрос:** Как работает partition pruning в PostgreSQL и когда он не срабатывает?
+
+---
+
+## 12. Как реализовать горизонтальное масштабирование микросервисов?
+
+Горизонтальное масштабирование (scale-out) — добавление новых инстансов сервиса вместо увеличения мощности одного. Ключевое требование: сервис должен быть **stateless** — не хранить состояние между запросами в памяти. Состояние выносится во внешние хранилища: сессии в Redis, данные в БД, файлы в S3.
+
+Инфраструктурные элементы: **Load Balancer** распределяет трафик между инстансами (round-robin, least-connections, consistent hashing для sticky sessions); **Auto-scaling** запускает новые инстансы при росте метрик (CPU, RPS, queue length). В Kubernetes это HPA (Horizontal Pod Autoscaler) и KEDA (масштабирование по Kafka lag, очереди задач). Service Discovery автоматически регистрирует новые инстансы.
+
+```yaml
+# Kubernetes HPA — масштабирование по CPU
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+❗ Ловушка собеса: Масштабирование сервиса не помогает, если БД — узкое место. Stateless-сервис с 20 инстансами упрётся в один PostgreSQL. Для масштабирования БД нужны read-replicas, connection pooling (PgBouncer), caching (Redis), или шардирование.
+
+**→ Уточняющий вопрос:** Что такое KEDA и как масштабировать consumer-сервис по lag в Kafka?
+
+---
+
+## 13. Что такое паттерн Database per Service?
+
+Database per Service — архитектурный принцип, при котором каждый микросервис владеет своей базой данных, и никакой другой сервис не имеет прямого доступа к ней. Доступ к данным сервиса — только через его API. Это обеспечивает loose coupling: изменение схемы БД в одном сервисе не ломает другие.
+
+Преимущества: независимый деплой (не нужно координировать миграции между командами); каждый сервис выбирает подходящую БД (PostgreSQL для транзакционных данных, MongoDB для документов, Redis для кэша, Elasticsearch для поиска); изоляция отказов (проблема с БД одного сервиса не влияет на другие). В интернет-магазине: `OrderService` → PostgreSQL, `CatalogService` → Elasticsearch, `CartService` → Redis, `NotificationService` → Cassandra.
+
+```
+order-service    payment-service    notification-service
+      │                 │                    │
+  PostgreSQL         PostgreSQL           Cassandra
+  (orders DB)      (payments DB)       (notifications DB)
+
+  Нельзя: SELECT * FROM payment_db.transactions  ← прямой доступ запрещён
+  Можно: GET /api/payments/{orderId}/status       ← через API
+```
+
+❗ Ловушка собеса: Что делать, когда нужна агрегация данных из нескольких сервисов (например, «заказы с деталями оплаты»)? Варианты: API Composition (Gateway собирает данные через несколько вызовов), CQRS с materialized view (отдельный сервис строит денормализованное представление на основе событий), или GraphQL Federation.
+
+**→ Уточняющий вопрос:** Как реализовать паттерн API Composition без N+1 проблемы при агрегации данных из 5 сервисов?
+
+---
+
+## 14. Какие проблемы возникают при использовании общей базы данных?
+
+Общая БД (Shared Database anti-pattern) — когда несколько микросервисов читают и пишут в одну базу данных напрямую. Это разрушает независимость сервисов и фактически делает архитектуру распределённым монолитом.
+
+Основные проблемы: **схемная связанность** — изменение таблицы ломает все сервисы, использующие её; **невозможность независимого деплоя** — нужно координировать миграции между командами; **конкуренция за ресурсы** — один «шумный» сервис (bulky queries) деградирует производительность для всех; **невозможность выбрать разные технологии** — нельзя использовать MongoDB для одного и PostgreSQL для другого; **проблемы с connection pool** — 20 сервисов × 10 соединений = 200 соединений к одной БД.
+
+```
+Anti-pattern:                          Pattern:
+order-service ──┐                   order-service → orders-db
+                ├──→ shared-db      payment-service → payments-db
+payment-service─┤                   catalog-service → catalog-db
+                │
+catalog-service─┘
+(все пишут в одну схему)          (каждый владеет своей схемой)
+```
+
+❗ Ловушка собеса: Иногда интервьюер описывает ситуацию «у нас два сервиса используют одну БД, но разные схемы/таблицы — это нормально?». Формально нет: сохраняется инфраструктурная связанность (один PostgreSQL-инстанс, общий connection pool, риск взаимного влияния). Лучше разные инстансы даже если разные схемы.
+
+**→ Уточняющий вопрос:** Как мигрировать с общей БД к Database per Service без остановки системы?
+
+---
+
+## 15. Как организовать коммуникацию между микросервисами?
+
+Выбор механизма коммуникации зависит от требований к latency, надёжности и связанности. **Синхронная коммуникация** (REST, gRPC) — для операций, требующих немедленного ответа: проверка наличия товара перед оформлением заказа, получение данных пользователя. gRPC предпочтителен для внутренних вызовов: бинарный протокол, строгий контракт (protobuf), streaming. **Асинхронная коммуникация** через брокер сообщений (Kafka, RabbitMQ) — для событий: «заказ создан», «оплата получена». Даёт temporal decoupling (сервисы не должны быть доступны одновременно).
+
+Типичная комбинация: синхронные запросы для query-операций (получить данные), асинхронные события для command-операций (что-то произошло). `OrderService` синхронно проверяет цену в `CatalogService` (gRPC), но асинхронно публикует `OrderCreated` в Kafka для `PaymentService` и `NotificationService`.
+
+```java
+// gRPC клиент для синхронного вызова
+@GrpcClient("catalog-service")
+private CatalogServiceGrpc.CatalogServiceBlockingStub catalogClient;
+
+public Price getProductPrice(String productId) {
+    PriceRequest request = PriceRequest.newBuilder()
+        .setProductId(productId)
+        .build();
+    return catalogClient.getPrice(request); // синхронный вызов
+}
+
+// Kafka продюсер для асинхронного события
+public void publishOrderCreated(Order order) {
+    kafkaTemplate.send("order.created",
+        order.getId().toString(),
+        new OrderCreatedEvent(order));
+}
+```
+
+❗ Ловушка собеса: Не все вызовы нужно делать через Kafka ради «асинхронности». Если пользователь ждёт ответа на HTTP-запрос, оборачивание в события только усложняет код (request-reply через Kafka — антипаттерн для таких случаев). Kafka — для событий, REST/gRPC — для запрос-ответ.
+
+**→ Уточняющий вопрос:** Как реализовать request-reply паттерн поверх Kafka и когда это оправдано?
+
+---
+
+## 16. В чём разница между синхронной и асинхронной коммуникацией?
+
+**Синхронная коммуникация** (REST, gRPC, GraphQL): отправитель блокируется и ждёт ответ. Простая модель программирования, легко отлаживать, низкая latency для единичного запроса. Но: temporal coupling (оба сервиса должны быть доступны одновременно), cascading failures (падение downstream сервиса влияет на upstream), проблема fan-out при агрегации (нужно ждать самого медленного).
+
+**Асинхронная коммуникация** (Kafka, RabbitMQ, SNS/SQS): отправитель публикует сообщение и продолжает работу. Temporal decoupling (producer и consumer не обязаны работать одновременно), высокая пропускная способность, буферизация пиков нагрузки. Но: eventual consistency (нет немедленного подтверждения), сложность трейсинга и отладки, нужно обрабатывать дубли (at-least-once delivery), harder to reason about.
+
+```
+Синхронная:                          Асинхронная:
+Order → Payment (HTTP/gRPC)          Order → Kafka → Payment
+Order ждёт ответ                     Order продолжает работу
+Latency: latency_payment             Latency: ~0 (только pub)
+Reliability: зависит от Payment      Reliability: Kafka гарантирует доставку
+Consistency: немедленная             Consistency: eventual
+```
+
+❗ Ловушка собеса: «Асинхронность всегда лучше» — популярное заблуждение. Асинхронная архитектура сложнее в отладке, мониторинге и обработке ошибок. Для бизнес-операций, где пользователь ждёт ответа, часто правильнее синхронный вызов с Circuit Breaker + таймаутом.
+
+**→ Уточняющий вопрос:** Как гарантировать exactly-once семантику при асинхронной коммуникации через Kafka?
+
+---
+
+## 17. Как обеспечить отказоустойчивость микросервисов?
+
+Отказоустойчивость строится на нескольких уровнях. На уровне отдельных вызовов: **Circuit Breaker** (fail-fast при деградации), **Retry с exponential backoff** (переживаем временные сбои), **таймауты** (не ждать бесконечно), **Bulkhead** (изолируем влияние одного сервиса на другой). На уровне данных: **идемпотентность операций** (повтор запроса не создаёт дубли), **Outbox Pattern** (атомарная запись данных и событий). На уровне инфраструктуры: **репликация** (несколько инстансов за балансировщиком), **graceful degradation** (fallback-ответы при недоступности).
+
+Ключевой принцип: **design for failure** — считайте, что любой вызов может упасть, любой сервис может быть недоступен. В Netflix это называют «chaos engineering»: Chaos Monkey случайно убивает инстансы в продакшне, чтобы убедиться, что система выдерживает отказы.
+
+```java
+// Resilience4j: Retry + CircuitBreaker + Timeout + Bulkhead вместе
+@CircuitBreaker(name = "payment", fallbackMethod = "paymentFallback")
+@Retry(name = "payment")
+@Bulkhead(name = "payment", type = Bulkhead.Type.THREADPOOL)
+@TimeLimiter(name = "payment")
+public CompletableFuture<PaymentResult> charge(PaymentRequest request) {
+    return CompletableFuture.supplyAsync(() -> paymentClient.charge(request));
+}
+
+private CompletableFuture<PaymentResult> paymentFallback(
+        PaymentRequest request, Exception e) {
+    // ставим в очередь для отложенной обработки
+    pendingPayments.enqueue(request);
+    return CompletableFuture.completedFuture(PaymentResult.pending());
+}
+```
+
+❗ Ловушка собеса: Порядок применения паттернов важен. Правильный порядок: Bulkhead → CircuitBreaker → Timeout → Retry. Retry должен быть внутри CircuitBreaker (чтобы не ретраить при открытом breaker), Bulkhead снаружи (ограничивает ресурсы до любых попыток).
+
+**→ Уточняющий вопрос:** Как graceful degradation реализовать на уровне продукта — какие функции «отключить» в первую очередь при перегрузке?
+
+---
+
+## 18. Что такое паттерн Bulkhead?
+
+Bulkhead (переборка) — паттерн изоляции ресурсов, аналогия с водонепроницаемыми переборками корабля. Если один отсек затоплен, корабль не тонет. В микросервисах: если вызовы к `PaymentService` зависают, они не должны исчерпать весь пул потоков `OrderService` и тем самым заблокировать обработку других запросов.
+
+Два вида Bulkhead в Resilience4j: **Semaphore Bulkhead** — ограничивает количество параллельных вызовов (семафор N, остальные отклоняются немедленно); **ThreadPool Bulkhead** — выделяет отдельный пул потоков для каждого внешнего вызова (вызов выполняется в отдельном thread pool, основной поток освобождается). ThreadPool лучше при долгих блокирующих вызовах, Semaphore — для быстрых и реактивных.
+
+```java
+// Bulkhead: отдельный thread pool для каждого downstream сервиса
+BulkheadConfig config = BulkheadConfig.custom()
+    .maxConcurrentCalls(10)        // максимум 10 параллельных вызовов к payment
+    .maxWaitDuration(Duration.ofMillis(100))  // ждать свободный слот 100мс
+    .build();
+
+// application.yml
+resilience4j.bulkhead:
+  instances:
+    payment:
+      maxConcurrentCalls: 10
+      maxWaitDuration: 100ms
+    inventory:
+      maxConcurrentCalls: 20
+      maxWaitDuration: 50ms
+```
+
+❗ Ловушка собеса: Bulkhead без Circuit Breaker не полноценная защита: запросы будут отклоняться из-за занятого пула, но не из-за деградации сервиса. Пара Bulkhead + CircuitBreaker: Bulkhead ограничивает ресурсы, CircuitBreaker останавливает поток при проблемах downstream.
+
+**→ Уточняющий вопрос:** Как выбрать правильный размер Bulkhead (количество слотов) для конкретного сервиса?
+
+---
+
+## 19. Что такое паттерн Retry и как его правильно использовать?
+
+Retry — автоматический повтор операции при временной ошибке (transient failure): сетевой сбой, временная недоступность, timeout. Правильное использование требует соблюдения нескольких условий: **идемпотентность** (повтор не создаёт дубль — GET, DELETE идемпотентны по HTTP, POST — нет по умолчанию); **ограничение попыток** (не ретраить бесконечно); **задержка между попытками** (не бомбардировать сервис); **разграничение ошибок** (429 Too Many Requests — ретрай, 400 Bad Request — нет, 500 — зависит от операции).
+
+Критически важно: добавлять **idempotency-key** для неидемпотентных операций. При оплате заказа — UUID, который платёжная система сохраняет; повторный запрос с тем же ключом вернёт результат первого, не создав второй платёж.
+
+```java
+// Resilience4j Retry
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(3)
+    .waitDuration(Duration.ofMillis(500))
+    .retryExceptions(IOException.class, TimeoutException.class)
+    .ignoreExceptions(BusinessException.class, ValidationException.class)
+    .retryOnResult(response -> response.getStatus() == 503)
+    .build();
+
+// С idempotency-key для POST
+public PaymentResult charge(PaymentRequest request) {
+    String idempotencyKey = UUID.randomUUID().toString();
+    return retry.executeSupplier(() ->
+        paymentClient.charge(request, idempotencyKey) // ключ в заголовке
+    );
+}
+```
+
+❗ Ловушка собеса: Retry Storm — ситуация, когда сервис деградировал, все клиенты начинают ретраить одновременно, и суммарная нагрузка убивает уже перегруженный сервис окончательно. Решение: exponential backoff + jitter (рандомизация задержки) + Circuit Breaker (прекращает ретраи при открытом breaker).
+
+**→ Уточняющий вопрос:** Что такое jitter в контексте retry и какие алгоритмы jitter существуют (full, equal, decorrelated)?
+
+---
+
+## 20. Что такое exponential backoff?
+
+Exponential backoff — стратегия задержки между повторными попытками, при которой каждая следующая задержка экспоненциально больше предыдущей. Базовая формула: `delay = min(maxDelay, base * 2^attempt)`. Например: 1с → 2с → 4с → 8с → 16с (cap на 30с). Цель — дать сервису время восстановиться, не бомбардируя его постоянными запросами.
+
+Проблема «чистого» exponential backoff: если 1000 клиентов получили ошибку одновременно, они все начнут ретраить с одинаковыми задержками — синхронные волны нагрузки. Решение — **jitter** (случайная добавка к задержке): каждый клиент отступает на случайное время. AWS рекомендует **Full Jitter**: `delay = random(0, min(maxDelay, base * 2^attempt))`. **Equal Jitter**: `delay = base * 2^attempt / 2 + random(0, base * 2^attempt / 2)`. **Decorrelated Jitter**: `delay = random(base, previousDelay * 3)`.
+
+```java
+// Exponential backoff с full jitter
+public long calculateDelay(int attempt) {
+    long exponentialDelay = (long) Math.min(
+        MAX_DELAY_MS,
+        BASE_DELAY_MS * Math.pow(2, attempt)
+    );
+    // Full jitter: случайное значение от 0 до exponentialDelay
+    return ThreadLocalRandom.current().nextLong(0, exponentialDelay + 1);
+}
+
+// В Resilience4j
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(5)
+    .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(
+        Duration.ofMillis(500),  // initial interval
+        2.0,                      // multiplier
+        0.5                       // randomization factor
+    ))
+    .build();
+```
+
+❗ Ловушка собеса: Exponential backoff без cap (максимальной задержки) может дать очень большие значения (2^10 = 1024 секунды). Всегда ограничивай максимальную задержку. Также: при долгом backoff клиент может получить timeout от вышестоящего сервиса раньше, чем исчерпает попытки.
+
+**→ Уточняющий вопрос:** Как экспоненциальный backoff взаимодействует с таймаутом вышестоящего HTTP-запроса?
+
+---
+
+## 21. Как мониторить распределённую систему микросервисов?
+
+Мониторинг строится на «трёх китах» (Three Pillars of Observability): **метрики** (metrics), **логи** (logs), **трейсы** (traces). Метрики — агрегированные числовые показатели: RPS, latency (p50/p95/p99), error rate, CPU/RAM. Стек: приложение экспортирует метрики в формате Prometheus (`/actuator/prometheus`), Prometheus собирает и хранит, Grafana визуализирует. Алерты: Alertmanager отправляет уведомления в Slack/PagerDuty при нарушении порогов.
+
+Логи централизуются: каждый сервис пишет структурированные JSON-логи со стандартными полями (`traceId`, `spanId`, `service`, `level`), они агрегируются в ELK (Elasticsearch + Logstash + Kibana) или Loki + Grafana. Структурированные логи позволяют делать запросы по полям. Трейсы связывают все три вида данных через `traceId`.
+
+```yaml
+# Spring Boot Actuator + Micrometer + Prometheus
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, prometheus
+  metrics:
+    tags:
+      application: order-service
+      environment: production
+
+# Grafana SLO дашборд: RED метрики (Rate, Errors, Duration)
+# Rate: sum(rate(http_requests_total{job="order-service"}[5m]))
+# Errors: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(...))
+# Duration: histogram_quantile(0.99, http_request_duration_seconds_bucket)
+```
+
+❗ Ловушка собеса: Логи без `traceId` бесполезны в микросервисной среде — ты не сможешь восстановить цепочку вызовов. Минимум: propagate `X-Trace-Id` заголовок через все сервисы и включать в каждый лог-запись. Без структурированных логов (JSON) автоматический парсинг и агрегация невозможны.
+
+**→ Уточняющий вопрос:** Как настроить SLI/SLO для микросервиса и что такое error budget?
+
+---
+
+## 22. Что такое distributed tracing?
+
+Distributed tracing — механизм отслеживания одного запроса через всю цепочку микросервисов. Каждый входящий запрос получает уникальный **trace ID**, который передаётся (propagate) во все downstream вызовы через HTTP-заголовки (`traceparent` в W3C формате или `X-B3-TraceId` в Zipkin формате). Каждый шаг обработки создаёт **span** — единицу работы с ID, именем, временными метками, статусом и атрибутами. Все spans одного trace образуют дерево вызовов.
+
+Инструменты: **OpenTelemetry** — стандарт для инструментирования (SDK для Java, авто-инструментирование Spring Boot); **Jaeger** / **Zipkin** — backend для хранения и визуализации трейсов. OpenTelemetry → OTLP протокол → Jaeger. Интеграция со Spring Boot через `spring-boot-starter-actuator` + `micrometer-tracing-bridge-otel`.
+
+```java
+// Spring Boot 3.x + Micrometer Tracing (auto-configuration)
+// traceId автоматически добавляется в MDC и логи, propagate в Feign/WebClient
+
+// Ручное добавление span для важных операций
+@Autowired
+private Tracer tracer;
+
+public Order processOrder(CreateOrderRequest request) {
+    Span span = tracer.nextSpan()
+        .name("order.process")
+        .tag("order.userId", request.getUserId())
+        .start();
+
+    try (Tracer.SpanInScope ws = tracer.withSpan(span)) {
+        // весь код внутри этого try автоматически привязан к span
+        return doProcessOrder(request);
+    } catch (Exception e) {
+        span.tag("error", e.getMessage());
+        throw e;
+    } finally {
+        span.end();
+    }
+}
+```
+
+Jaeger UI показывает: «запрос `/api/orders` занял 450мс: OrderService 50мс → PaymentService 300мс (bottleneck!) → NotificationService 100мс». Это невозможно без трейсинга.
+
+❗ Ловушка собеса: Sampling — нельзя хранить 100% трейсов при высокой нагрузке (дорого). Head-based sampling: решение принимается на входе (10% запросов трейсим). Tail-based sampling: решение после завершения запроса (трейсим 100% ошибок + 1% успешных) — умнее, но сложнее.
+
+**→ Уточняющий вопрос:** Как propagate трейс-контекст через Kafka message (не HTTP)?
+
+---
+
+## 23. Как реализовать аутентификацию и авторизацию в микросервисах?
+
+Стандартный подход: **OAuth2/OIDC** с централизованным Identity Provider (Keycloak, Auth0, AWS Cognito). Пользователь аутентифицируется один раз, получает **JWT access token** (короткоживущий, 15-60 минут) и **refresh token** (долгоживущий). JWT содержит: `sub` (userId), `roles`/`scope`, `exp` (expiry). Каждый микросервис валидирует JWT локально по публичному ключу IdP (без обращения к серверу авторизации на каждый запрос).
+
+API Gateway проверяет наличие и базовую валидность токена; бизнес-сервисы проверяют roles/scope для конкретных операций. Для межсервисных вызовов (service-to-service) используют Client Credentials Flow: сервис получает токен по своему client_id/secret (machine-to-machine auth).
+
+```java
+// Spring Security: Resource Server (валидация JWT)
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/orders").hasRole("USER")
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            );
+        return http.build();
+    }
+}
+
+// application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://keycloak:8080/realms/shop/protocol/openid-connect/certs
+```
+
+❗ Ловушка собеса: JWT нельзя отозвать до истечения срока — это главный недостаток. Если токен украден, он работает до `exp`. Решения: короткий lifetime (15 минут) + refresh token rotation; token introspection endpoint (проверка у IdP — но это нагрузка); blacklist токенов в Redis (хранить jti отозванных токенов).
+
+**→ Уточняющий вопрос:** Как передавать контекст пользователя (userId, tenantId) через цепочку внутренних микросервисов?
+
+---
+
+## 24. Что такое паттерн Strangler Fig?
+
+Strangler Fig (по названию тропического растения-«душителя», постепенно обвивающего и заменяющего дерево) — паттерн постепенной миграции с монолита на микросервисы. Вместо рискованного «big bang» переписывания (полностью переписать, потом развернуть) система мигрируется небольшими частями, при этом работает непрерывно.
+
+Реализация: перед монолитом ставится **Strangler Facade** (прокси/API Gateway). Новые функции разрабатываются сразу как микросервисы. Существующие модули переписываются по одному в микросервисы, и Gateway переключает трафик на новый сервис. Монолит постепенно «сужается» — удаляются переписанные части. В идеале монолит в итоге удаляется полностью.
+
+```
+Этап 1:                    Этап 2:                    Этап 3:
+Client                     Client                     Client
+  │                          │                          │
+Gateway                    Gateway                    Gateway
+  │                         / \                       /   \
+Монолит              Монолит   OrderService    PaymentService  OrderService
+(всё)               (без order)                       (монолит удалён)
+
+POST /orders → монолит    POST /orders → OrderService
+GET  /users  → монолит    GET  /users  → монолит
+```
+
+В интернет-магазине: начали с `OrderService` (высокая нагрузка, нужно масштабировать отдельно), потом `CatalogService`, потом `UserService`. На каждом этапе Gateway переключает часть трафика на новый сервис, можно делать canary deployment.
+
+❗ Ловушка собеса: Самая сложная часть Strangler Fig — данные, а не код. Как разделить общую БД? Для начала новый сервис может читать из той же БД (Anti-Corruption Layer), но со временем нужно переносить данные в отдельную БД — это самый сложный шаг миграции.
+
+**→ Уточняющий вопрос:** Как провести «разрез» в монолите — по каким критериям выделять сервис первым (DDD Bounded Context)?
+
+---
+
+## 25. Как тестировать микросервисы?
+
+Тестирование строится по **Testing Pyramid** с учётом специфики микросервисов. **Unit-тесты** (быстрые, изолированные) тестируют бизнес-логику без внешних зависимостей. **Integration-тесты** с **TestContainers** запускают реальные зависимости (PostgreSQL, Kafka, Redis) в Docker-контейнерах в рамках теста — это надёжнее моков для проверки SQL-запросов, Kafka consumer'ов, транзакций.
+
+**Contract-тесты (Consumer-Driven Contract Tests)** — ключевой инструмент для микросервисов. **Pact** или **Spring Cloud Contract**: потребитель (consumer) описывает контракт (что он ожидает от API провайдера), провайдер верифицирует, что соответствует контракту. Это позволяет выявить breaking changes до интеграции в CI/CD. **E2E-тесты** — минимально (дорогие, медленные, нестабильные), только для критических business flows.
+
+```java
+// TestContainers: интеграционный тест с реальным Kafka
+@SpringBootTest
+@Testcontainers
+class OrderServiceIntegrationTest {
+
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(
+        DockerImageName.parse("confluentinc/cp-kafka:7.4.0")
+    );
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15");
+
+    @DynamicPropertySource
+    static void properties(DynamicPropertyRegistry registry) {
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    }
+
+    @Test
+    void createOrder_shouldPublishOrderCreatedEvent() {
+        // реальный Kafka + реальный PostgreSQL в тесте
+        OrderResponse order = orderService.createOrder(new CreateOrderRequest(...));
+        // verify event published to Kafka
+        ConsumerRecord<String, OrderCreatedEvent> record = KafkaTestUtils.getSingleRecord(...);
+        assertThat(record.value().getOrderId()).isEqualTo(order.getId());
+    }
+}
+```
+
+❗ Ловушка собеса: «Мы тестируем через e2e с реальными сервисами» — антипаттерн для unit/integration уровня. E2E тесты медленные, нестабильные (flaky), трудно определить причину падения. Contract-тесты дают уверенность в совместимости сервисов без E2E. Золотое правило: если можно протестировать с TestContainers, не делай E2E.
+
+**→ Уточняющий вопрос:** Как организовать тестирование Saga — как проверить, что компенсирующие шаги запускаются корректно?
+
+---
+
+## 26. Какие инструменты используются для оркестрации микросервисов?
+
+**Kubernetes** — стандарт де-факто для оркестрации контейнеров. Решает: деплой (Deployment, StatefulSet), масштабирование (HPA, VPA, KEDA), Service Discovery (Service, DNS), конфигурацию (ConfigMap, Secret), health checks (liveness/readiness probes), rolling updates и rollbacks. Kubernetes — это не просто «запустить контейнеры», это декларативное управление желаемым состоянием системы.
+
+**Helm** — пакетный менеджер для Kubernetes: шаблонизирует манифесты, управляет релизами (install, upgrade, rollback). **Service Mesh** (Istio, Linkerd) — дополнительный слой для управления коммуникацией: mTLS между сервисами, traffic splitting (canary deployments), observability без изменения кода, retry/timeout на уровне sidecar-прокси. **GitOps** инструменты (ArgoCD, Flux) — синхронизируют состояние кластера с Git-репозиторием.
+
+```yaml
+# Kubernetes Deployment для order-service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # zero-downtime deploy
+  template:
+    spec:
+      containers:
+        - name: order-service
+          image: order-service:1.2.3
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "500m", memory: "1Gi" }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8080 }
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            initialDelaySeconds: 30
+```
+
+❗ Ловушка собеса: Разница между `liveness` и `readiness` probe в Kubernetes. `Readiness` — сервис готов принимать трафик (убрать из балансировщика при деградации, не убивать pod). `Liveness` — сервис живой (перезапустить pod при deadlock/зависании). Ошибка: использовать одну и ту же проверку для обоих — readiness должна проверять зависимости (БД доступна?), liveness — только базовую жизнеспособность процесса.
+
+**→ Уточняющий вопрос:** Что такое Istio sidecar pattern и какие проблемы он решает по сравнению с библиотечными решениями (Resilience4j, Spring Cloud)?
