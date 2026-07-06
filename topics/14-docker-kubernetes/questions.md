@@ -18,6 +18,8 @@
 
 **→ Уточняющий вопрос:** Как контейнеры обеспечивают изоляцию файловой системы — что такое union filesystem и зачем нужны слои образа?
 
+**↳ Ответ:** Docker использует OverlayFS: образ состоит из неизменяемых read-only слоёв, поверх которых при старте контейнера добавляется один write-слой (copy-on-write). Если контейнер изменяет файл — он копируется в write-слой, оригинальный слой не трогается. Слои разделяются между контейнерами — 10 контейнеров одного образа не дублируют файлы на диске, это ускоряет `docker pull` и экономит место.
+
 ---
 
 ## 2. В чём отличие контейнера от виртуальной машины?
@@ -45,6 +47,8 @@ VM:         Контейнер:
 ❗ **Ловушка собеса:** «Контейнеры более безопасны, чем VM?» — нет, VM изолированы лучше (отдельное ядро). Контейнеры легче и быстрее, но шаренное ядро — это потенциальная поверхность атаки. В security-sensitive окружениях используют gVisor или Kata Containers (VM-like изоляция + скорость контейнеров).
 
 **→ Уточняющий вопрос:** Что такое слои Docker-образа и как работает copy-on-write при записи в контейнере?
+
+**↳ Ответ:** Каждая инструкция `RUN`/`COPY`/`ADD` в Dockerfile создаёт новый read-only слой — diff относительно предыдущего. При записи из контейнера OverlayFS копирует файл из нижнего слоя в верхний write-слой (copy-on-write) — образ не изменяется. Практическое следствие: если в контейнере удалить файл из нижнего слоя, он «исчезает» в write-слое, но физически занимает место в образе — вот почему надо объединять `RUN rm ...` в одну инструкцию с созданием файла.
 
 ---
 
@@ -84,6 +88,8 @@ docker run -p 8080:8080 -e SPRING_PROFILES_ACTIVE=prod myapp:1.0
 ❗ **Ловушка собеса:** «Почему слои важны?» — порядок инструкций влияет на кеш. Если `COPY pom.xml` стоит перед `RUN mvn dependency:resolve`, зависимости кешируются отдельно от кода. При изменении только Java-кода зависимости не перекачиваются. Если же сразу `COPY . .` — любое изменение кода инвалидирует кеш зависимостей.
 
 **→ Уточняющий вопрос:** Как оптимизировать кеширование слоёв Dockerfile для Maven/Gradle проекта?
+
+**↳ Ответ:** Правило: от редко меняемого к часто меняемому. Сначала копируй `pom.xml` и скачивай зависимости (`RUN mvn dependency:go-offline`) — этот слой кешируется, пока не изменится `pom.xml`. Затем копируй `src/` и собирай. Так при изменении только кода Java зависимости не перекачиваются — сборка в CI ускоряется с минут до секунд. Для Gradle: сначала `build.gradle` + `gradlew`, затем `./gradlew dependencies`, затем `./gradlew build`.
 
 ---
 
@@ -133,6 +139,8 @@ ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} -jar app.jar"]
 
 **→ Уточняющий вопрос:** Почему лучше использовать `COPY` вместо `ADD` для копирования файлов проекта?
 
+**↳ Ответ:** `ADD` делает скрытые вещи: автоматически распаковывает tar-архивы и умеет скачивать URL — это неочевидно при чтении Dockerfile и создаёт непредсказуемое поведение. Правило: `COPY` — всегда по умолчанию; `ADD` — только если явно нужна распаковка архива прямо в образе. Это делает Dockerfile читаемым и предсказуемым.
+
 ---
 
 ## 5. В чём разница между CMD и ENTRYPOINT?
@@ -159,6 +167,8 @@ CMD ["--spring.profiles.active=default"]
 ❗ **Ловушка собеса:** Shell form vs exec form — это любимый вопрос на собесах. Shell form означает PID 1 = `/bin/sh`, Java-процесс — дочерний. `docker stop` шлёт SIGTERM PID 1 (sh), sh не форвардит сигнал детям, через 10 секунд SIGKILL. Spring Boot не успевает graceful shutdown: не закрывает соединения с БД, не завершает in-flight запросы. Всегда используй exec form.
 
 **→ Уточняющий вопрос:** Как настроить graceful shutdown в Spring Boot при работе в Docker, и какую роль играет `server.shutdown=graceful`?
+
+**↳ Ответ:** `server.shutdown=graceful` заставляет Spring Boot при получении SIGTERM перестать принимать новые запросы и дождаться завершения текущих (таймаут — `spring.lifecycle.timeout-per-shutdown-phase`, дефолт 30s). Но это работает только если SIGTERM доходит до JVM: ENTRYPOINT должен быть в exec form `["java", "-jar", "app.jar"]`, а не shell form. В K8s добавь `lifecycle.preStop: exec: sleep 5` — это даёт время kube-proxy убрать Pod из iptables до того как придёт SIGTERM.
 
 ---
 
@@ -213,6 +223,8 @@ ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
 ❗ **Ловушка собеса:** Layered JAR (стейдж 2 в примере) — продвинутый паттерн. Spring Boot 2.3+ поддерживает `jarmode=layertools`, который разделяет JAR на слои: зависимости (меняются редко) → код приложения (меняется часто). При пересборке только изменённые слои не берутся из кеша Docker. На собесе это демонстрирует понимание оптимизации CI/CD.
 
 **→ Уточняющий вопрос:** Какой размер у типичного production Docker образа для Spring Boot, и как его можно уменьшить?
+
+**↳ Ответ:** Наивный Dockerfile с JDK + Maven + FAT JAR внутри даёт ~500–800 МБ. Multi-stage build с `eclipse-temurin:21-jre-alpine` снижает до ~130–200 МБ. Дальше: layered JAR разделяет зависимости и код — при пересборке только изменённый слой не берётся из кеша Docker-registry. Максимальное сокращение: GraalVM Native Image даёт ~30–80 МБ и мгновенный старт, но требует AOT-компиляции и ограничивает использование рефлексии.
 
 ---
 
@@ -277,6 +289,8 @@ docker compose down -v        # остановить и удалить volumes
 
 **→ Уточняющий вопрос:** Чем Docker Compose отличается от Kubernetes и когда что использовать?
 
+**↳ Ответ:** Compose — один хост, один файл, простота: идеален для локальной разработки и небольших staging-окружений. Kubernetes — кластер машин с автоматическим масштабированием, самовосстановлением и rolling updates: нужен в production где требуется отказоустойчивость. Правило выбора: если один `docker compose up` закрывает все потребности — используй Compose; если нужно масштабировать горизонтально, деплоить без даунтайма, или распределять нагрузку по нескольким хостам — K8s.
+
 ---
 
 ## 8. Что такое Kubernetes и зачем он нужен?
@@ -304,6 +318,8 @@ kubectl exec -it myapp-7d4f9b-xk2p1 -n production -- /bin/sh
 ❗ **Ловушка собеса:** «K8s это замена Docker Compose?» — нет, это разные уровни. Compose — для локальной разработки (один хост, простота). K8s — для production (кластер машин, отказоустойчивость, масштабирование). Многие команды используют Compose локально и K8s в prod. Также: K8s не работает с Docker напрямую — использует Container Runtime Interface (CRI), сейчас обычно containerd.
 
 **→ Уточняющий вопрос:** Что такое etcd и почему его потеря означает потерю кластера?
+
+**↳ Ответ:** etcd — распределённое key-value хранилище (алгоритм Raft), единственный источник истины для всего состояния кластера: все Deployments, Pods, Services, Secrets хранятся там. При потере etcd API Server не может ни читать, ни писать состояние — кластер перестаёт функционировать. Поэтому etcd в production всегда кластер (3 или 5 нод для кворума), а бэкап делается регулярно через `etcdctl snapshot save`.
 
 ---
 
@@ -349,6 +365,8 @@ spec:
 
 **→ Уточняющий вопрос:** Почему не стоит деплоить приложения напрямую как Pod, а использовать Deployment?
 
+**↳ Ответ:** Pod без контроллера — одиночка: упал — остался упавшим, никто не пересоздаст. Deployment управляет ReplicaSet, который отвечает за нужное число реплик и автопересоздание при сбое. Плюс Deployment даёт rolling update, rollback историю и декларативное управление версиями. Голый Pod создаётся только для одноразовых диагностических задач (`kubectl run debug --image=...`), не для production-сервисов.
+
 ---
 
 ## 10. Что такое Node в Kubernetes?
@@ -378,6 +396,8 @@ kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data
 ❗ **Ловушка собеса:** «Что произойдёт если worker node упадёт?» — Controller Manager обнаружит, что kubelet перестал слать heartbeat (через ~5 минут по умолчанию, `node-monitor-grace-period`). Node переходит в статус `NotReady`, поды помечаются как Terminating и пересоздаются на других узлах. Stateless приложения переживут это прозрачно, stateful — могут потерять данные без PersistentVolume.
 
 **→ Уточняющий вопрос:** Что такое Node Affinity и Pod Anti-Affinity, и зачем они нужны в production?
+
+**↳ Ответ:** Node Affinity — правила размещения Pod на нодах с определёнными характеристиками (label): например, только на нодах с SSD или в нужной availability zone. Pod Anti-Affinity — запрет размещать реплики одного Deployment на одной ноде или в одной зоне. Без Anti-Affinity все 3 реплики могут оказаться на одной ноде — если нода упадёт, сервис полностью недоступен. В production Anti-Affinity по зонам (`topologyKey: topology.kubernetes.io/zone`) — стандарт HA.
 
 ---
 
@@ -418,6 +438,8 @@ kubectl get svc -n production
 ❗ **Ловушка собеса:** «Service балансирует по round-robin?» — в режиме iptables выбор endpoint случаен (stateless random), в режиме IPVS можно настроить алгоритм (round-robin, least-connections). Также: если selector не совпадает ни с одним Pod — Service существует, но EndPoints пустой, трафик уходит в никуда. Это частая причина `Connection refused` при опечатке в label.
 
 **→ Уточняющий вопрос:** Как Service узнаёт о появлении или исчезновении подов — как работает механизм Endpoints?
+
+**↳ Ответ:** Endpoint Controller в control plane следит за Pods через API Server watch: при появлении Pod с label, совпадающим с selector Service — добавляет его IP:port в объект EndpointSlice. При удалении Pod или провале readiness probe — убирает. kube-proxy на каждой ноде тоже подписан на EndpointSlice и обновляет правила iptables/IPVS. Всё event-driven через watch — никакого polling.
 
 ---
 
@@ -467,6 +489,8 @@ spec:
 
 **→ Уточняющий вопрос:** Чем Ingress отличается от LoadBalancer Service, и почему Ingress предпочтительнее для множества микросервисов?
 
+**↳ Ответ:** LoadBalancer Service создаёт отдельный облачный балансировщик (и отдельный внешний IP с биллингом) для каждого Service — 10 микросервисов = 10 LB = дорого. Ingress — один LoadBalancer для одного Ingress Controller, который маршрутизирует трафик по hostname и path к десяткам ClusterIP Services. Плюс Ingress даёт TLS-терминацию, rewrite URL, rate limiting в одном месте. Практически: LoadBalancer только для самого Ingress Controller, остальные сервисы — ClusterIP.
+
 ---
 
 ## 13. Что такое ReplicaSet?
@@ -509,6 +533,8 @@ kubectl describe rs myapp-deployment-7d4f9b8c6d
 
 **→ Уточняющий вопрос:** Как Deployment управляет несколькими ReplicaSet во время rolling update?
 
+**↳ Ответ:** При обновлении Deployment создаёт новый ReplicaSet с новым pod template (новым образом). Затем постепенно увеличивает `replicas` нового RS и уменьшает `replicas` старого, соблюдая `maxSurge` и `maxUnavailable`. Старые RS не удаляются — остаются с `replicas: 0` для возможного rollback (количество хранимых ревизий задаётся `revisionHistoryLimit`, дефолт 10). `kubectl rollout undo` просто возвращает реплики в предыдущий RS.
+
 ---
 
 ## 14. Как происходит масштабирование в Kubernetes?
@@ -537,6 +563,8 @@ kubectl describe hpa myapp -n production
 ❗ **Ловушка собеса:** «Масштабировать Spring Boot приложение легко, просто добавь реплики» — это правда только если приложение stateless. Если Spring Security хранит сессии в памяти (in-memory session), при переключении на другой Pod пользователь будет разлогинен. Решение: `spring-session` с Redis backend. Аналогично — кэш Caffeine/Ehcache не шарится между репликами, нужен Redis/Hazelcast.
 
 **→ Уточняющий вопрос:** Как Spring Boot приложение должно быть спроектировано, чтобы корректно масштабироваться в Kubernetes?
+
+**↳ Ответ:** Три правила stateless: не хранить сессии в памяти (используй Spring Session + Redis), не хранить файлы локально (используй S3/объектное хранилище), не держать локальный кэш Caffeine/Ehcache как источник истины (используй Redis/Hazelcast). Плюс: настрой `server.shutdown=graceful` и readiness probe — K8s не пустит трафик на не готовый Pod и даст время завершить текущие запросы при shutdown.
 
 ---
 
@@ -584,6 +612,8 @@ spec:
 ❗ **Ловушка собеса:** HPA не работает без Metrics Server (не входит в базовую установку K8s). Без него HPA будет в статусе `unknown`. Также: если `resources.requests` не задан, HPA не может вычислить процент использования. Масштабирование по памяти ненадёжно для Java — JVM резервирует память заранее (heap + metaspace + off-heap), потребление не снижается при низкой нагрузке. Лучше масштабировать по CPU или кастомным метрикам (RPS, queue length через KEDA).
 
 **→ Уточняющий вопрос:** Что такое KEDA и чем оно лучше стандартного HPA для event-driven приложений?
+
+**↳ Ответ:** KEDA (Kubernetes Event-Driven Autoscaling) масштабирует Deployment на основе длины очереди сообщений (Kafka consumer lag, RabbitMQ queue depth) — стандартный HPA умеет только CPU/memory. Для Kafka Consumer: KEDA смотрит lag — 10 000 непрочитанных сообщений → поднимает реплики; lag = 0 → может масштабировать до 0 реплик (HPA не умеет). Это идеально для batch-обработчиков и event-driven микросервисов, где нагрузка нерегулярная.
 
 ---
 
@@ -657,6 +687,8 @@ spec:
 
 **→ Уточняющий вопрос:** Как безопасно передать секреты в Kubernetes в production — какие инструменты используются вместо нативных Secrets?
 
+**↳ Ответ:** Три production-подхода: 1) **External Secrets Operator** — синхронизирует секреты из AWS Secrets Manager/HashiCorp Vault в K8s Secrets автоматически, реальный секрет живёт во внешней системе; 2) **Sealed Secrets** — шифрует Secret публичным ключом кластера, зашифрованный файл хранится в Git (GitOps-friendly, никто не видит значение); 3) **Vault Agent Injector** — sidecar инжектирует секреты прямо в Pod как файлы, минуя etcd полностью.
+
 ---
 
 ## 17. Что такое liveness probe?
@@ -696,6 +728,8 @@ Spring Boot 2.3+ предоставляет отдельные endpoints `/actua
 ❗ **Ловушка собеса:** Неправильный `initialDelaySeconds` — классическая ошибка. Spring Boot с Hibernate, Flyway, большим контекстом может стартовать 30–60 секунд. Если `initialDelaySeconds: 15`, liveness сработает раньше старта, Kubernetes начнёт бесконечно перезапускать поды (CrashLoopBackOff). Используй `startupProbe` вместо `initialDelaySeconds` — он даёт время на старт, потом передаёт контроль liveness.
 
 **→ Уточняющий вопрос:** Что такое startupProbe и чем он лучше `initialDelaySeconds` для медленно стартующих Spring Boot приложений?
+
+**↳ Ответ:** `startupProbe` — отдельная probe только для фазы старта: пока она не прошла успешно, liveness и readiness не запускаются. Безопаснее чем `initialDelaySeconds` потому что адаптивна: `failureThreshold × periodSeconds` задаёт максимальное время ожидания, но если Spring Boot стартанул быстро — probe сразу передаёт управление liveness. `initialDelaySeconds` — жёсткая задержка: слишком маленькая убьёт медленный старт, слишком большая замедляет обнаружение краша.
 
 ---
 
@@ -747,6 +781,8 @@ eventPublisher.publishEvent(
 
 **→ Уточняющий вопрос:** Как настроить readiness probe для graceful shutdown Spring Boot в Kubernetes при rolling update?
 
+**↳ Ответ:** При `server.shutdown=graceful` Spring Boot автоматически переводит `ReadinessState` в `REFUSING_TRAFFIC` при получении SIGTERM — readiness probe начнёт падать и Pod исключится из Service endpoints. Добавь `lifecycle.preStop: exec: sleep 5` — kube-proxy обновляет iptables с задержкой, sleep даёт ему время убрать Pod из ротации до того, как придёт SIGTERM. Порядок: `preStop sleep` → SIGTERM → Spring graceful shutdown → Pod terminated.
+
 ---
 
 ## 19. Зачем нужны health checks?
@@ -794,6 +830,8 @@ public class ExternalApiHealthIndicator implements HealthIndicator {
 ❗ **Ловушка собеса:** «Подключим проверку БД к liveness» — смертельная ошибка при массовых сбоях. Представь: PostgreSQL перегружен, 10 реплик Spring Boot одновременно зафейлили liveness → K8s перезапускает все 10 → они снова все стучатся в БД при старте → ещё большая нагрузка. Cascade failure. Правило: liveness проверяет только внутреннее состояние JVM/процесса, readiness — внешние зависимости.
 
 **→ Уточняющий вопрос:** Как Spring Boot Actuator разделяет health indicators между liveness и readiness группами?
+
+**↳ Ответ:** Spring Boot 2.3+ создаёт две группы автоматически: `liveness` содержит только `LivenessStateHealthIndicator`, `readiness` — `ReadinessStateHealthIndicator` + все health indicators зависимостей (db, redis, kafka). Кастомный HealthIndicator попадает в обе группы по умолчанию; явно задаётся через `management.endpoint.health.group.readiness.include=db,redis,myCheck`. Правило: в liveness — ничего про внешние зависимости, иначе получишь cascade restart при сбое БД.
 
 ---
 
@@ -844,6 +882,8 @@ spec:
 ❗ **Ловушка собеса:** Ingress Controller ≠ Ingress. Без установленного Ingress Controller манифест Ingress просто лежит в etcd и ничего не делает. Также: `path: /api/v1` с `pathType: Prefix` и `pathType: Exact` ведут себя по-разному. `Exact` требует точного совпадения, `Prefix` — совпадение префикса пути. Частая ошибка: `pathType: Prefix` с `/api/v1` перехватит `/api/v1`, `/api/v1/users`, `/api/v10` (!)  — нужно учитывать.
 
 **→ Уточняющий вопрос:** Что такое cert-manager и как он автоматизирует выпуск Let's Encrypt сертификатов для Ingress?
+
+**↳ Ответ:** cert-manager — K8s-оператор, следящий за Ingress с аннотацией `cert-manager.io/cluster-issuer`. При обнаружении автоматически запрашивает сертификат через ACME (Let's Encrypt), проходит HTTP-01 или DNS-01 challenge, сохраняет в Secret указанный в `spec.tls.secretName` и отслеживает renewal (обновляет за 30 дней до истечения). Без cert-manager всё это делается вручную каждые 90 дней — с ним это полностью автоматизировано.
 
 ---
 
@@ -906,6 +946,8 @@ spec:
 ❗ **Ловушка собеса:** Namespace ≠ сетевая изоляция. По умолчанию Pod в `dev` может достучаться до `prod` базы данных по DNS. Для настоящей изоляции нужны NetworkPolicy. Также: системные namespace (`kube-system`, `kube-public`, `kube-node-lease`) удалять нельзя — это убьёт кластер. При удалении пользовательского namespace все ресурсы внутри удаляются каскадно — будь осторожен.
 
 **→ Уточняющий вопрос:** Как настроить NetworkPolicy для запрета межnamespace трафика при мультитенантном кластере?
+
+**↳ Ответ:** По умолчанию K8s разрешает весь трафик между namespace. Создай `default-deny` NetworkPolicy в каждом namespace с пустым `ingress: []` — запрет всего входящего. Затем явно разреши нужное через `namespaceSelector` с label нужного namespace. Важно: NetworkPolicy работает только если CNI-плагин её поддерживает — Calico и Cilium да, flannel нет. Для строгой изоляции tenant'ов Cilium с `CiliumNetworkPolicy` даёт более гибкий контроль.
 
 ---
 
@@ -975,6 +1017,8 @@ kubectl rollout undo deployment/myapp --to-revision=2 -n production
 
 **→ Уточняющий вопрос:** Чем blue-green деплой отличается от rolling update и когда он предпочтительнее?
 
+**↳ Ответ:** Rolling update постепенно заменяет поды — в какой-то момент в production одновременно работают и старая, и новая версия (проблема при несовместимых изменениях API или схемы БД). Blue-green поднимает полноценный второй stack (green) рядом со старым (blue) и переключает трафик мгновенно через Ingress/Service selector — при проблеме откат за секунды. Предпочтительнее при: несовместимых изменениях схемы, критичных деплоях, когда нужен мгновенный rollback без состояния смешанных версий.
+
 ---
 
 ## 23. Что такое StatefulSet и когда его использовать?
@@ -1039,6 +1083,8 @@ spec:
 ❗ **Ловушка собеса:** «StatefulSet для всего stateful» — нет. Если управляемый облачный сервис (RDS, Cloud SQL) доступен — используй его, не разворачивай БД в K8s без острой необходимости. Операционная сложность резко возрастает: бэкапы, репликация, failover — всё вручную. Для Java-разработчика важно: Spring Boot сервис сам должен быть stateless (Deployment), а StatefulSet — для инфраструктуры (БД, брокеры).
 
 **→ Уточняющий вопрос:** Как организовать бэкап PersistentVolume в Kubernetes и что такое VolumeSnapshot?
+
+**↳ Ответ:** VolumeSnapshot — K8s API для снапшотов PV через CSI-драйверы (AWS EBS, GCP PD, Azure Disk): создаёшь объект `VolumeSnapshot`, CSI-драйвер делает снапшот на уровне облака, восстанавливаешь через `dataSource: volumeSnapshot` в новом PVC. Для комплексных бэкапов — Velero: бэкапит и данные PV (через restic/Kopia), и K8s объекты вместе, что позволяет восстановить весь namespace. Без бэкапов PV — StatefulSet в prod это риск необратимой потери данных.
 
 ---
 
@@ -1130,3 +1176,5 @@ kubectl logs -f deployment/myapp -n production --all-containers
 ❗ **Ловушка собеса:** «Просто смотрим логи через kubectl logs» — это не мониторинг. При рестарте Pod логи теряются (если нет log aggregation). Правильный ответ: централизованный сбор логов (Fluentd/Fluent Bit → Elasticsearch/Loki), структурированные логи в JSON (`logstash-logback-encoder` для Spring Boot), корреляция логов с трейсами через `traceId` (Spring Cloud Sleuth / Micrometer Tracing + Zipkin/Jaeger). На собесе ценится понимание полного observability стека, а не только «смотрю в Grafana».
 
 **→ Уточняющий вопрос:** Как настроить распределённую трассировку (distributed tracing) между микросервисами в Spring Boot с Kubernetes?
+
+**↳ Ответ:** Подключи Micrometer Tracing + Brave/OpenTelemetry: автоматически создаётся `traceId`, который пробрасывается через HTTP-заголовки (`traceparent`) между сервисами. Трейсы экспортируются в Jaeger/Zipkin/Tempo. В K8s: деплой Jaeger через Helm, в `application.properties`: `management.tracing.sampling.probability=1.0` и endpoint коллектора. Logback автоматически включает `traceId` в каждое лог-сообщение при наличии Micrometer Tracing в classpath — это связывает логи и трейсы.
